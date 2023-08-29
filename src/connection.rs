@@ -22,6 +22,8 @@ use crate::auth::PgLiteAuthenticator;
 use crate::backend::PgLitebackendFactory;
 use crate::query_handler::PgQueryProcessor;
 
+const GSSENC_REQUEST_MAGIC_NUMBER: i32 = 80877104;
+
 pub struct PgLiteConnection<F, A>  {
     pub connection_id: Uuid,
     #[allow(unused)]
@@ -57,9 +59,12 @@ where F:PgLitebackendFactory, A: PgLiteAuthenticator {
         // Configure Socket
         stream.set_nodelay(true)?;
 
+        // First peek for GSSENC - and always reply NO if requested
+        self.peek_for_gssenc_request(&mut stream).await?;   
+
         // Check for a TLS connection
         let tls_acceptor:Option<TlsAcceptor> = None; // TODO: Handle TLS...
-        self.is_tls = self.peek_for_tlsrequest(&mut stream, tls_acceptor.is_some()).await?;
+        self.is_tls = self.peek_for_tls_request(&mut stream, tls_acceptor.is_some()).await?;
         
         // Build Client Info
         let client_info: ClientInfoHolder = ClientInfoHolder::new(socket_addr, self.is_tls);
@@ -205,10 +210,31 @@ where F:PgLitebackendFactory, A: PgLiteAuthenticator {
         Ok(())
     }
 
-    async fn peek_for_tlsrequest(&self, tcp_socket: &mut TcpStream, tls_supported: bool) -> Result<bool, IOError> {
-        // Copied from pgwire implementation :)
-        let mut ssl = false;
-        let mut buf = [0u8; SslRequest::BODY_SIZE];
+    async fn peek_for_tls_request(&self, tcp_socket: &mut TcpStream, tls_supported: bool) -> Result<bool, IOError> {
+        let found = self.peek_for_magic(tcp_socket, SslRequest::BODY_MAGIC_NUMBER, true).await?;
+        if found {
+            if tls_supported {
+                tcp_socket.write_all(b"S").await?;
+                return Ok(true);
+            } else {
+                tcp_socket.write_all(b"N").await?;
+                return Ok(false);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn peek_for_gssenc_request(&self, tcp_socket: &mut TcpStream) -> Result<bool, IOError> {
+        let found = self.peek_for_magic(tcp_socket, GSSENC_REQUEST_MAGIC_NUMBER, true).await?;
+        if found {
+            tcp_socket.write_all(b"N").await?;  // Always NO - we don't support!    
+        }
+        Ok(false)
+    }
+
+
+    async fn peek_for_magic(&self, tcp_socket: &mut TcpStream, magic_number:i32, consume_bytes_if_found:bool) -> Result<bool, IOError> {
+        let mut buf: [u8; 8] = [0u8; SslRequest::BODY_SIZE];
         let mut buf = ReadBuf::new(&mut buf);
         loop {
             let size = poll_fn(|cx| tcp_socket.poll_peek(cx, &mut buf)).await?;
@@ -216,25 +242,20 @@ where F:PgLitebackendFactory, A: PgLiteAuthenticator {
                 // the tcp_stream has ended
                 return Ok(false);
             }
+
             if size == SslRequest::BODY_SIZE {
                 let mut buf_ref = buf.filled();
-                // skip first 4 bytes
-                buf_ref.get_i32();
-                if buf_ref.get_i32() == SslRequest::BODY_MAGIC_NUMBER {
-                    // the socket is sending sslrequest, read the first 8 bytes
-                    // skip first 8 bytes
-                    tcp_socket
-                        .read_exact(&mut [0u8; SslRequest::BODY_SIZE])
-                        .await?;
-                    // ssl configured
-                    if tls_supported {
-                        ssl = true;
-                        tcp_socket.write_all(b"S").await?;
-                    } else {
-                        tcp_socket.write_all(b"N").await?;
+
+                buf_ref.get_i32(); // skip first 4 bytes (it's the length)
+                if buf_ref.get_i32() == magic_number {
+                    if consume_bytes_if_found {
+                        // Consume the bytes
+                        tcp_socket.read_exact(&mut [0u8; SslRequest::BODY_SIZE]).await?;
                     }
+                    return Ok(true);
+                } else { 
+                    return Ok(false);
                 }
-                return Ok(ssl);
             }
         }
     }
